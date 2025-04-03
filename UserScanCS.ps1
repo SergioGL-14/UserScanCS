@@ -252,6 +252,5 @@ $btnExportar.Add_Click({
 ##############################################################################
 # Final: Mostrar formulario
 ##############################################################################
-$form.Topmost = $true
 $form.Add_Shown({ $form.Activate() })
 $form.ShowDialog()
