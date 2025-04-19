@@ -1,273 +1,256 @@
-# ================================================================
-# UserScanCS Refactorizado - Escaneo paralelo de usuarios en equipos
-# Versión: 1.1
-# ================================================================
+# UserScanCS - Escaneo paralelo de usuarios en equipos con RunspacePool
 
-#region Parámetros y Constantes
-# Ruta al CSV de configuración
-$csvPath = "..\..\data\csv\COPIA_SERGAS_CUENTAS_AD_FULL.csv"
-# Herramienta PsExec
-$psexecPath = "..\..\resources\tools\PsExec.exe"
-# Archivo de log
-$logFile = "$PSScriptRoot\UserScanCS.log"
-#endregion
+##############################################################################
+# BLOQUE 1: Carga de CSV y diccionario Centro → Equipos
+##############################################################################
+$RutaCSV = "..\..\data\csv\COPIA_SERGAS_CUENTAS_AD_FULL.csv"
+$CentrosEquipos = @{}
 
-# Iniciar registro de ejecución
-try {
-    Start-Transcript -Path $logFile -Append -ErrorAction Stop
-} catch {
-    Write-Warning "No se pudo iniciar el registro: $_"
-}
-
-#region Funciones Principales
-function Load-Configuration {
-    <#
-    .SYNOPSIS
-        Carga centros y equipos desde el CSV.
-    .OUTPUTS
-        Hashtable con clave Centro y valor array de Equipos.
-    #>
-    if (-not (Test-Path $csvPath)) {
-        Throw "Archivo de configuración no encontrado: $csvPath"
-    }
-    $table = @{}
-    Import-Csv -Path $csvPath -Delimiter ';' | ForEach-Object {
-        $key = $_.OU.Trim()
-        $machine = $_.Equipo.Trim()
-        if (-not $table.ContainsKey($key)) { $table[$key] = @() }
-        if ($machine -and -not $table[$key].Contains($machine)) {
-            $table[$key] += $machine
-        }
-    }
-    return $table
-}
-
-function Get-LastLoggedOnUser {
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory)][string]$ComputerName
-    )
+if (Test-Path $RutaCSV) {
     try {
-        $reg = [Microsoft.Win32.RegistryKey]::OpenRemoteBaseKey('LocalMachine', $ComputerName)
-        $key = $reg.OpenSubKey('SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Authentication\\LogonUI')
-        return $key?.GetValue('LastLoggedOnUser') -or ''
-    } catch {
-        return ''
-    }
-}
-
-function Get-ADNameSurname {
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory)][string]$SamAccountName
-    )
-    try {
-        if (-not (Get-Module ActiveDirectory)) { Import-Module ActiveDirectory -ErrorAction Stop }
-        $user = Get-ADUser -Filter { SamAccountName -eq $SamAccountName } -Properties GivenName, Surname -ErrorAction Stop
-        return @{ GivenName = $user.GivenName; Surname = $user.Surname }
-    } catch {
-        return @{ GivenName = ''; Surname = '' }
-    }
-}
-
-function Scan-Computer {
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory)][string]$Computer,
-        [Parameter(Mandatory)][string]$PsexecPath
-    )
-    $result = [PSCustomObject]@{
-        Computer    = $Computer
-        Status      = 'Inaccesible'
-        Login       = ''
-        GivenName   = ''
-        Surname     = ''
-    }
-    # Verificar conexión
-    if (-not (Test-Connection -ComputerName $Computer -Count 1 -Quiet)) { return $result }
-
-    # Intentar quser remota
-    $user = ''
-    try {
-        if (Test-Path $PsexecPath) {
-            $output = & $PsexecPath -nobanner "\\$Computer" quser 2>&1
-            foreach ($line in $output) {
-                if ($line -match '^\s*(\S+)') {
-                    $user = $matches[1]; break
-                }
+        $Datos = Import-Csv -Path $RutaCSV -Delimiter ';'
+        foreach ($linea in $Datos) {
+            $centro = $linea.OU.Trim()
+            $equipo = $linea.Equipo.Trim()
+            if (-not $CentrosEquipos.ContainsKey($centro)) {
+                $CentrosEquipos[$centro] = @()
             }
+            $CentrosEquipos[$centro] += $equipo
         }
-    } catch { }
-
-    if ($user) {
-        $result.Status = 'Ocupado'
-    } else {
-        $user = Get-LastLoggedOnUser -ComputerName $Computer
-        $result.Status = if ($user) { 'Libre' } else { 'Libre (SIN ACCESO)' }
+    } catch {
+        [System.Windows.Forms.MessageBox]::Show("Error al cargar el CSV: $_", "Error", "OK", "Error")
+        return
     }
-    $result.Login = $user
-
-    if ($user) {
-        $adInfo = Get-ADNameSurname -SamAccountName ($user.Split('\\')[-1])
-        $result.GivenName = $adInfo.GivenName
-        $result.Surname   = $adInfo.Surname
-    }
-    return $result
-}
-#endregion
-
-#region Interfaz Gráfica - Diseño Moderno
-# Carga ensamblados
-Add-Type -AssemblyName System.Windows.Forms, System.Drawing
-
-# Form principal
-$form = New-Object System.Windows.Forms.Form -Property @{ 
-    Text            = 'UserScanCS - Escaneo de Usuarios'
-    Size            = [System.Drawing.Size]::new(820, 700)
-    StartPosition   = 'CenterScreen'
-    BackColor       = [System.Drawing.Color]::FromArgb(245,245,245)
-    Font            = 'Segoe UI,10'
+} else {
+    [System.Windows.Forms.MessageBox]::Show("Archivo CSV no encontrado en la ruta:`n$RutaCSV", "Error", "OK", "Error")
+    return
 }
 
-# ComboBox de Centros
-$comboCenters = [System.Windows.Forms.ComboBox]::new()
-$comboCenters.SetBounds(20,20,450,30)
-$comboCenters.DropDownStyle     = 'DropDown'
-$comboCenters.AutoCompleteMode   = 'SuggestAppend'
-$comboCenters.AutoCompleteSource = 'ListItems'
-$form.Controls.Add($comboCenters)
+##############################################################################
+# BLOQUE 2: Interfaz gráfica
+##############################################################################
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+$form = New-Object System.Windows.Forms.Form
+$form.Text = "UserScanCS - Escaneo de Usuarios en Equipos"
+$form.Size = New-Object System.Drawing.Size(800,660)
+$form.StartPosition = "CenterScreen"
+$form.BackColor = [System.Drawing.Color]::FromArgb(245,245,245)
+$form.Font = "Segoe UI,9"
 
-# Botón Escanear
-$btnScan = [System.Windows.Forms.Button]::new()
-$btnScan.Text      = 'Escanear'
-$btnScan.SetBounds(490,18,120,30)
-$btnScan.FlatStyle = 'Flat'
-$btnScan.BackColor  = [System.Drawing.Color]::FromArgb(0,120,215)
-$btnScan.ForeColor  = 'White'
-$form.Controls.Add($btnScan)
+$comboCentros = New-Object System.Windows.Forms.ComboBox
+$comboCentros.Location = New-Object System.Drawing.Point(20,20)
+$comboCentros.Size = New-Object System.Drawing.Size(400,30)
+$comboCentros.DropDownStyle = 'DropDown'
+$comboCentros.AutoCompleteMode = 'SuggestAppend'
+$comboCentros.AutoCompleteSource = 'ListItems'
+$comboCentros.Items.AddRange(($CentrosEquipos.Keys | Sort-Object))
+$form.Controls.Add($comboCentros)
 
-# ProgressBar de escaneo
-$progress = [System.Windows.Forms.ProgressBar]::new()
-$progress.SetBounds(20,60,760,20)
-$progress.Style = 'Continuous'
-$form.Controls.Add($progress)
+$btnEscanear = New-Object System.Windows.Forms.Button
+$btnEscanear.Text = "Escanear Equipos"
+$btnEscanear.Location = New-Object System.Drawing.Point(440, 18)
+$btnEscanear.Size = New-Object System.Drawing.Size(150,30)
+$btnEscanear.BackColor = [System.Drawing.Color]::FromArgb(0,120,215)
+$btnEscanear.ForeColor = "White"
+$btnEscanear.FlatStyle = "Flat"
+$form.Controls.Add($btnEscanear)
 
-# ListView de Resultados
-$listView = [System.Windows.Forms.ListView]::new()
-$listView.SetBounds(20,100,760,440)
-$listView.View         = 'Details'
-$listView.FullRowSelect= $true
-$listView.GridLines    = $true
-$listView.Columns.Add('Equipo',150)
-$listView.Columns.Add('Estado',120)
-$listView.Columns.Add('Login',120)
-$listView.Columns.Add('Nombre',180)
-$listView.Columns.Add('Apellidos',180)
-$form.Controls.Add($listView)
+$listEquipos = New-Object System.Windows.Forms.ListView
+$listEquipos.Location = New-Object System.Drawing.Point(20, 70)
+$listEquipos.Size = New-Object System.Drawing.Size(760, 440)
+$listEquipos.View = 'Details'
+$listEquipos.FullRowSelect = $true
+$listEquipos.GridLines = $true
+$listEquipos.Columns.Add("Equipo", 140)
+$listEquipos.Columns.Add("Estado", 140)
+$listEquipos.Columns.Add("Login", 120)
+$listEquipos.Columns.Add("Nombre", 140)
+$listEquipos.Columns.Add("Apellidos", 180)
+$form.Controls.Add($listEquipos)
 
-# Label de Estado\ `$lblStatus = [System.Windows.Forms.Label]::new()
-$lblStatus.SetBounds(20,560,500,25)
-$lblStatus.Text       = 'Listo.'
-$lblStatus.ForeColor  = 'DarkSlateGray'
-$form.Controls.Add($lblStatus)
+$lblEstado = New-Object System.Windows.Forms.Label
+$lblEstado.Location = New-Object System.Drawing.Point(20,520)
+$lblEstado.Size = New-Object System.Drawing.Size(600,20)
+$lblEstado.Text = "Listo para escanear..."
+$lblEstado.ForeColor = "DarkSlateGray"
+$form.Controls.Add($lblEstado)
 
-# Botón Exportar
-$btnExport = [System.Windows.Forms.Button]::new()
-$btnExport.Text      = 'Exportar CSV'
-$btnExport.SetBounds(620,555,160,30)
-$btnExport.FlatStyle = 'Flat'
-$btnExport.BackColor  = [System.Drawing.Color]::FromArgb(0,120,215)
-$btnExport.ForeColor  = 'White'
-$form.Controls.Add($btnExport)
-#endregion
+$btnExportar = New-Object System.Windows.Forms.Button
+$btnExportar.Text = "Exportar Resultados"
+$btnExportar.Location = New-Object System.Drawing.Point(620, 520)
+$btnExportar.Size = New-Object System.Drawing.Size(160, 30)
+$btnExportar.BackColor = [System.Drawing.Color]::FromArgb(0,120,215)
+$btnExportar.ForeColor = "White"
+$btnExportar.FlatStyle = "Flat"
+$form.Controls.Add($btnExportar)
 
-#region Eventos
-# Cargar configuración al iniciar
-try {
-    $config = Load-Configuration
-    $comboCenters.Items.AddRange($config.Keys | Sort-Object)
-} catch {
-    [System.Windows.Forms.MessageBox]::Show("Error al cargar configuración:`n$_","Error","OK","Error")
-    Exit
-}
-
-# Manejar clic Escanear
-$btnScan.Add_Click({
-    $listView.Items.Clear()
-    $lblStatus.Text   = 'Iniciando escaneo...'
-    $progress.Value   = 0
+##############################################################################
+# BLOQUE 3: Escaneo paralelo usando RunspacePool
+##############################################################################
+$psexecPath = "..\..\resources\tools\PsExec.exe"
+$btnEscanear.Add_Click({
+    $listEquipos.Items.Clear()
+    $lblEstado.Text = "Iniciando escaneo..."
     $form.Refresh()
 
-    $center = $comboCenters.Text.Trim()
-    if (-not $config.ContainsKey($center)) {
-        [System.Windows.Forms.MessageBox]::Show('Centro no válido.','Error','OK','Error')
+    $centroSeleccionado = $comboCentros.Text
+    if (-not $CentrosEquipos.ContainsKey($centroSeleccionado)) {
+        [System.Windows.Forms.MessageBox]::Show("Centro no válido o no encontrado.","Error","OK","Error")
         return
     }
 
-    $machines = $config[$center]
-    $count    = $machines.Count; $i=0
+    $equipos = $CentrosEquipos[$centroSeleccionado]
     $runspacePool = [runspacefactory]::CreateRunspacePool(1,10)
     $runspacePool.Open()
-    $jobs = @()
+    $runspaces = @()
 
-    foreach ($machine in $machines) {
-        $psInstance = [powershell]::Create()
-        $psInstance.RunspacePool = $runspacePool
-        $psInstance.AddScript(${function:Scan-Computer}).AddArgument($machine).AddArgument($psexecPath) | Out-Null
-        $jobs += @{ Instance = $psInstance; Async = $psInstance.BeginInvoke() }
+    foreach ($equipo in $equipos) {
+        $ps = [powershell]::Create()
+        $ps.RunspacePool = $runspacePool
+
+        $script = {
+            param($equipo, $psexecPath)
+
+            function Get-ADNombreApellidos {
+                param ([string]$login)
+                if (-not $login) { return @("","") }
+                try {
+                    $samAccountName = $login.Split('\')[-1]
+                    $user = Get-ADUser -Filter { SamAccountName -eq $samAccountName } -Properties GivenName, Surname
+                    if ($user) {
+                        return @($user.GivenName, $user.Surname)
+                    }
+                } catch {
+                    return @("","")
+                }
+                return @("","")
+            }
+
+            function Get-LastLoggedUser {
+                param ([string]$Equipo)
+                try {
+                    $reg = [Microsoft.Win32.RegistryKey]::OpenRemoteBaseKey('LocalMachine', $Equipo)
+                    $key = $reg.OpenSubKey("SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Authentication\\LogonUI")
+                    if ($key) {
+                        $valor = $key.GetValue("LastLoggedOnUser")
+                        if ($valor) {
+                            return $valor
+                        }
+                    }
+                } catch {
+                    return ""
+                }
+                return ""
+            }
+
+            $resultado = @{ Equipo=$equipo; Estado='Inaccesible'; Login=''; Nombre=''; Apellidos='' }
+
+            if (Test-Connection -ComputerName $equipo -Count 1 -Quiet -ErrorAction SilentlyContinue) {
+                $usuario = ""
+
+                try {
+                    if (Test-Path $psexecPath) {
+                        $quserOutput = & $psexecPath -nobanner "\\$equipo" quser 2>&1
+                        foreach ($line in $quserOutput) {
+                            if ($line -match "^\s*(\S+)\s+[\w\s]+\s+(Activo|Active)") {
+                                $usuario = $matches[1]
+                                break
+                            }
+                        }
+                    }
+                } catch {}
+
+                if ($usuario) {
+                    $resultado.Estado = "Ocupado"
+                } else {
+                    $usuario = Get-LastLoggedUser -Equipo $equipo
+                    if ($usuario) {
+                        $resultado.Estado = "Libre"
+                    } else {
+                        $resultado.Estado = "Libre (SIN ACCESO)"
+                    }
+                }
+
+                $resultado.Login = $usuario
+                if ($usuario) {
+                    $res = Get-ADNombreApellidos -login $usuario
+                    $resultado.Nombre = $res[0]
+                    $resultado.Apellidos = $res[1]
+                }
+            }
+
+            return $resultado
+        }
+
+        $ps.AddScript($script).AddArgument($equipo).AddArgument($psexecPath)
+        $async = $ps.BeginInvoke()
+        $runspaces += @{ Pipe=$ps; Handle=$async }
     }
 
-    foreach ($job in $jobs) {
-        $res = $job.Instance.EndInvoke($job.Async)
-        $job.Instance.Dispose()
-        $item = [System.Windows.Forms.ListViewItem]::new($res.Computer)
-        $item.SubItems.Add($res.Status)
-        $item.SubItems.Add($res.Login)
-        $item.SubItems.Add($res.GivenName)
-        $item.SubItems.Add($res.Surname)
-        switch ($res.Status) {
-            'Ocupado'            { $item.ForeColor = 'DarkOrange' }
-            'Libre'              { $item.ForeColor = 'DarkGreen' }
-            'Libre (SIN ACCESO)' { $item.ForeColor = 'Gray' }
-            default              { $item.ForeColor = 'DarkRed' }
-        }
-        $listView.Items.Add($item)
+    foreach ($r in $runspaces) {
+        $resultado = $r.Pipe.EndInvoke($r.Handle)[0]
+        $r.Pipe.Dispose()
 
-        # Actualizar progreso
-        $i++;
-        $progress.Value    = [int](( $i / $count ) * 100)
-        $lblStatus.Text    = "Escaneado $i de $count equipos"
+        $item = New-Object System.Windows.Forms.ListViewItem($resultado.Equipo)
+        $item.SubItems.Add($resultado.Estado)
+        $item.SubItems.Add($resultado.Login)
+        $item.SubItems.Add($resultado.Nombre)
+        $item.SubItems.Add($resultado.Apellidos)
+
+        switch ($resultado.Estado) {
+            "Ocupado"               { $item.ForeColor = "DarkOrange" }
+            "Libre"                 { $item.ForeColor = "DarkGreen" }
+            "Libre (SIN ACCESO)"    { $item.ForeColor = "Gray" }
+            default                 { $item.ForeColor = "DarkRed" }
+        }
+
+        $listEquipos.Items.Add($item)
         $form.Refresh()
     }
 
-    $runspacePool.Close(); $runspacePool.Dispose()
-    $lblStatus.Text = "Escaneo completado: $center"
+    $runspacePool.Close()
+    $runspacePool.Dispose()
+    $lblEstado.Text = "Escaneo completado para centro: $centroSeleccionado"
 })
 
-# Manejar clic Exportar
-$btnExport.Add_Click({
-    if ($listView.Items.Count -eq 0) {
-        [System.Windows.Forms.MessageBox]::Show('Nada para exportar.','Aviso','OK','Information')
+##############################################################################
+# BLOQUE 4: Exportación de resultados
+##############################################################################
+$btnExportar.Add_Click({
+    if ($listEquipos.Items.Count -eq 0) {
+        [System.Windows.Forms.MessageBox]::Show("No hay resultados para exportar.","Aviso","OK","Information")
         return
     }
-    $dlg = [System.Windows.Forms.SaveFileDialog]::new()
-    $dlg.Filter   = 'CSV (*.csv)|*.csv'
-    $dlg.FileName = "Resultados_UserScanCS_$(Get-Date -Format yyyyMMdd).csv"
-    if ($dlg.ShowDialog() -eq 'OK') {
-        $file = $dlg.FileName
-        $listView.Items | ForEach-Object {
-            ($_.SubItems | ForEach-Object { $_.Text }) -join ';'
-        } | Set-Content -Path $file -Encoding UTF8
-        [System.Windows.Forms.MessageBox]::Show('Exportación exitosa.','Éxito','OK','Information')
+
+    $saveDialog = New-Object System.Windows.Forms.SaveFileDialog
+    $saveDialog.Filter = "CSV Files (*.csv)|*.csv|Text Files (*.txt)|*.txt"
+    $saveDialog.Title = "Guardar resultados"
+    $saveDialog.FileName = "Resultados_UserScanCS.csv"
+
+    if ($saveDialog.ShowDialog() -eq "OK") {
+        $ruta = $saveDialog.FileName
+        $contenido = @()
+
+        foreach ($item in $listEquipos.Items) {
+            $linea = @()
+            foreach ($subItem in $item.SubItems) {
+                $linea += $subItem.Text
+            }
+            $contenido += ($linea -join ";")
+        }
+
+        try {
+            $contenido | Set-Content -Path $ruta -Encoding UTF8
+            [System.Windows.Forms.MessageBox]::Show("Exportación completada con éxito.","Éxito","OK","Information")
+        } catch {
+            [System.Windows.Forms.MessageBox]::Show("Error al guardar archivo: $_","Error","OK","Error")
+        }
     }
 })
 
-# Mostrar formulario
-$form.Add_Shown({$form.Activate()})
-[void] $form.ShowDialog()
-
-# Finalizar registro
-try {
-    Stop-Transcript
-} catch {
-}
+##############################################################################
+# Final: Mostrar formulario
+##############################################################################
+$form.Add_Shown({ $form.Activate() })
+$form.ShowDialog()
